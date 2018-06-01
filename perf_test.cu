@@ -15,26 +15,35 @@ void* cuda_malloc(size_t size) {
   return devPtr;
 }
 
-// static const int NT = 128;
-// static const int VT = 4;
+static const int NT = 128;
+static const int VT = 4;
 
-static const int NT = 512;
-static const int VT = 1;
+// static const int NT = 512;
+// static const int VT = 1;
+
+static const int BIG_ARG_SIZE = 18 * 3;
+
+struct BigArg {
+  int big_arg[BIG_ARG_SIZE];
+};
 
 __launch_bounds__(NT, 4)
 __global__
-void add_kernel(float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ y, int N) {
+void add_kernel(float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ y, int N, BigArg big) {
   int tid = threadIdx.x;
   int cta = blockIdx.x;
   int nv = NT * VT;
   int start = nv * cta;
   int end = min(N, nv * (cta + 1));
   int count = end - start;
+  for (int i = 0; i < BIG_ARG_SIZE; i++) {
+    start += big.big_arg[i];
+  }
   if (count >= NT * VT) {
     int linearIndex = start + tid;
     #pragma unroll
     for (int i = 0; i < VT; i++) {
-      out[linearIndex] = x[linearIndex];// + y[linearIndex];
+      out[linearIndex] = x[linearIndex] + y[linearIndex];
       linearIndex += NT;
     }
   } else {
@@ -103,14 +112,19 @@ int main(int argc, char* argv[]) {
   dim3 block(NT);
   dim3 grid(N / block.x / VT);
 
+  BigArg big;
+  for (int i = 0; i < BIG_ARG_SIZE; i++) {
+    big.big_arg[i] = next_float() > 100 ? next_float() : 0;
+  }
+
   CUDA_CHECK(cudaDeviceSynchronize());
   for (int i = 0; i < 10; i++) {
     cuda_timestamp start;
-    add_kernel<<<grid, block>>>(res, x, y, N);
+    add_kernel<<<grid, block>>>(res, x, y, N, big);
     std::cout << "time " << start.elapsed_time() << "\n";
   }
 
-  // verify(res, x, y, N);
+  verify(res, x, y, N);
 
   // cuda_timestamp end;
   // int64_t ts[10];
