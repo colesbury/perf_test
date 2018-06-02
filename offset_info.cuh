@@ -29,6 +29,7 @@ struct OffsetInfo {
   }
 
   __host__ __device__ void get(unsigned int linearIndex,
+                               int* counter0,
                                const StrideInfo& s1,
                                const StrideInfo& s2,
                                const StrideInfo& s3,
@@ -46,6 +47,9 @@ struct OffsetInfo {
       }
       DivMod<unsigned int> divmod = sizes_[i].divmod(linearIndex);
       linearIndex = divmod.div;
+      if (i == 0) {
+        *counter0 = divmod.mod;
+      }
       *idx1 += divmod.mod * s1.strides[i];
       *idx2 += divmod.mod * s2.strides[i];
       *idx3 += divmod.mod * s3.strides[i];

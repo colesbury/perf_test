@@ -29,19 +29,37 @@ void add_kernel(float* __restrict__ out, const float* __restrict__ x, const floa
                 OffsetInfo o1, StrideInfo s1, StrideInfo s2, StrideInfo s3) {
   int tid = threadIdx.x;
   int cta = blockIdx.x;
+  int lane = tid % 32;
+  int warp = tid / 32;
   int nv = NT * VT;
   int start = nv * cta;
   int end = min(N, nv * (cta + 1));
   int count = end - start;
   if (count >= NT * VT) {
-    int linearIndex = start + tid;
+    int linearIndex = start + warp * VT * 32 + lane;
+
+    int counter0;
+    int idx1, idx2, idx3;
+    o1.get(linearIndex, &counter0, s1, s2, s3, &idx1, &idx2, &idx3);
+    counter0 = __shfl_sync(0xFFFFFFFF, counter0, 32);
+    if (counter0 + VT * 32 < o1.sizes_[0].divisor) {
+      #pragma unroll
+      for (int i = 0; i < VT; i++) {
+        out[idx1] = x[idx2] + y[idx3];
+        idx1 += s1.strides[0] * 32;
+        idx2 += s2.strides[0] * 32;
+        idx3 += s3.strides[0] * 32;
+      }
+      return;
+    }
+
     #pragma unroll
     for (int i = 0; i < VT; i++) {
       int idx1, idx2, idx3;
-      o1.get(linearIndex, s1, s2, s3, &idx1, &idx2, &idx3);
+      o1.get(linearIndex, &counter0, s1, s2, s3, &idx1, &idx2, &idx3);
 
       out[idx1] = x[idx2] + y[idx3];
-      linearIndex += NT;
+      linearIndex += 32;
     }
   } else {
     // assert(0);
@@ -94,8 +112,8 @@ static void fill_random(float* out_cuda, int N) {
 
 int main(int argc, char* argv[]) {
   static const int N = 1024 * 1024 * 10;
-  int64_t sizes[] = {10, 32, 32, 32, 32};
-  int64_t strides[] = {1, 10, 320, 10240, 327680};
+  int64_t sizes[] = {10 * 32, 32, 32, 32, 1};
+  int64_t strides[] = {1, 320, 10240, 327680, 327680};
 
   auto offset = OffsetInfo(5, sizes);
   auto stride_info = StrideInfo(5, strides);
