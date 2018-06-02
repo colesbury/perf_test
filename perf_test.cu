@@ -1,5 +1,6 @@
 #include "timestamps.cuh"
 #include "common.cuh"
+#include "offset_info.cuh"
 
 #include <stdexcept>
 #include <iostream>
@@ -15,35 +16,31 @@ void* cuda_malloc(size_t size) {
   return devPtr;
 }
 
-static const int NT = 128;
+static const int NT = 256;
 static const int VT = 4;
 
 // static const int NT = 512;
 // static const int VT = 1;
 
-static const int BIG_ARG_SIZE = 18 * 3;
-
-struct BigArg {
-  int big_arg[BIG_ARG_SIZE];
-};
 
 __launch_bounds__(NT, 4)
 __global__
-void add_kernel(float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ y, int N, BigArg big) {
+void add_kernel(float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ y, int N,
+                OffsetInfo o1, StrideInfo s1, StrideInfo s2, StrideInfo s3) {
   int tid = threadIdx.x;
   int cta = blockIdx.x;
   int nv = NT * VT;
   int start = nv * cta;
   int end = min(N, nv * (cta + 1));
   int count = end - start;
-  for (int i = 0; i < BIG_ARG_SIZE; i++) {
-    start += big.big_arg[i];
-  }
   if (count >= NT * VT) {
     int linearIndex = start + tid;
     #pragma unroll
     for (int i = 0; i < VT; i++) {
-      out[linearIndex] = x[linearIndex] + y[linearIndex];
+      int idx1, idx2, idx3;
+      o1.get(linearIndex, s1, s2, s3, &idx1, &idx2, &idx3);
+
+      out[idx1] = x[idx2] + y[idx3];
       linearIndex += NT;
     }
   } else {
@@ -97,9 +94,15 @@ static void fill_random(float* out_cuda, int N) {
 
 int main(int argc, char* argv[]) {
   static const int N = 1024 * 1024 * 10;
-  auto x = (float*)cuda_malloc(N * sizeof(float));
-  auto y = (float*)cuda_malloc(N * sizeof(float));
-  auto res = (float*)cuda_malloc(N * sizeof(float));
+  int64_t sizes[] = {10, 32, 32, 32, 32};
+  int64_t strides[] = {1, 10, 320, 10240, 327680};
+
+  auto offset = OffsetInfo(5, sizes);
+  auto stride_info = StrideInfo(5, strides);
+
+  auto x = (float*)cuda_malloc(N * 2 * sizeof(float));
+  auto y = (float*)cuda_malloc(N * 2 * sizeof(float));
+  auto res = (float*)cuda_malloc(N * 2 * sizeof(float));
 
   fill_random(x, N);
   fill_random(y, N);
@@ -112,15 +115,10 @@ int main(int argc, char* argv[]) {
   dim3 block(NT);
   dim3 grid(N / block.x / VT);
 
-  BigArg big;
-  for (int i = 0; i < BIG_ARG_SIZE; i++) {
-    big.big_arg[i] = next_float() > 100 ? next_float() : 0;
-  }
-
   CUDA_CHECK(cudaDeviceSynchronize());
   for (int i = 0; i < 10; i++) {
     cuda_timestamp start;
-    add_kernel<<<grid, block>>>(res, x, y, N, big);
+    add_kernel<<<grid, block>>>(res, x, y, N, offset, stride_info, stride_info, stride_info);
     std::cout << "time " << start.elapsed_time() << "\n";
   }
 
