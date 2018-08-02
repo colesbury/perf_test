@@ -6,9 +6,13 @@
 #include <iostream>
 #include <stdio.h>
 #include <assert.h>
+#include <cstring>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#define MGPU_DEVICE __device__
+#define MGPU_LAMBDA __device__
 
 void* cuda_malloc(size_t size) {
   void* devPtr;
@@ -16,53 +20,157 @@ void* cuda_malloc(size_t size) {
   return devPtr;
 }
 
-static const int NT = 256;
+static const int NT = 128;
 static const int VT = 4;
 
 // static const int NT = 512;
 // static const int VT = 1;
 
+enum ScalarType {
+  Byte,
+  Char,
+  Short,
+  Int,
+  Long,
+  Float,
+  Double
+};
 
-__launch_bounds__(NT, 4)
-__global__
-void add_kernel(float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ y, int N,
-                OffsetInfo o1, StrideInfo s1, StrideInfo s2, StrideInfo s3) {
-  int tid = threadIdx.x;
-  int cta = blockIdx.x;
-  int lane = tid % 32;
-  int warp = tid / 32;
-  int nv = NT * VT;
-  int start = nv * cta;
-  int end = min(N, nv * (cta + 1));
-  int count = end - start;
-  if (count >= NT * VT) {
-    int linearIndex = start + warp * VT * 32 + lane;
+static const int BYTE = 0x001;
+static const int CHAR = 0x002;
+static const int SHORT = 0x004;
+static const int INT = 0x1;
+static const int LONG = 0x1;
+static const int FLOAT = 0x1;
+static const int DOUBLE = 0x1;
 
-    int counter0;
-    int idx1, idx2, idx3;
-    o1.get(linearIndex, &counter0, s1, s2, s3, &idx1, &idx2, &idx3);
-    counter0 = __shfl_sync(0xFFFFFFFF, counter0, 32);
-    if (counter0 + VT * 32 < o1.sizes_[0].divisor) {
-      #pragma unroll
-      for (int i = 0; i < VT; i++) {
-        out[idx1] = x[idx2] + y[idx3];
-        idx1 += s1.strides[0] * 32;
-        idx2 += s2.strides[0] * 32;
-        idx3 += s3.strides[0] * 32;
-      }
-      return;
+
+// __device__ __noinline__ void cast(char* out, const char* in, ScalarType tout, ScalarType tin) {
+//   int64_t intval;
+//   float floatval;
+//   double doubleval;
+//   switch (tin) {
+//     case Byte: intval = *(uint8_t*)in; break;
+//     case Char: intval = *(int8_t*)in; break;
+//     case Short: intval = *(int16_t*)in; break;
+//     case Int: intval = *(int32_t*)in; break;
+//     case Long: intval = *(int64_t*)in; break;
+//     case Float: floatval = *(float*)in; break;
+//     case Double: doubleval = *(double*)in; break;
+//   }
+//   *(float*)out = (float)intval;
+// }
+// __global__
+// void sam_kernel(int N, int* out) {
+//   *out = N;
+// }
+
+// template<typename func_t>
+// __launch_bounds__(NT, 4)
+// __global__
+// void generic_kernel(int N, func_t f) {
+//   int tid = threadIdx.x;
+//   int cta = blockIdx.x;
+//   int nv = NT * VT;
+//   int start = nv * cta;
+//   int end = min(N, nv * (cta + 1));
+//   int count = end - start;
+//
+//   if (count >= NT * VT) {
+//     int idx = start + tid;
+//
+//     #pragma unroll
+//     for (int i = 0; i < VT; i++) {
+//       f(idx);
+//       idx += NT;
+//     }
+//   } else {
+//     assert(0);
+//   }
+// }
+
+template<typename arg1_t_, typename arg2_t_=arg1_t_, typename arg3_t_=arg2_t_>
+struct binary_args_t {
+  using arg1_t = arg1_t_;
+  using arg2_t = arg2_t_;
+  using arg3_t = arg3_t_;
+};
+
+template <typename T>
+struct function_traits : public function_traits<decltype(&T::operator())>
+{};
+// For generic types, directly use the result of the signature of its 'operator()'
+
+template <typename ClassType, typename ReturnType, typename... Args>
+struct function_traits<ReturnType(ClassType::*)(Args...) const>
+// we specialize for pointers to member function
+{
+    enum { arity = sizeof...(Args) };
+    // arity is the number of arguments.
+
+    typedef ReturnType result_type;
+
+    typedef std::tuple<Args...> args;
+
+    template <size_t i>
+    struct arg
+    {
+        typedef typename std::tuple_element<i, std::tuple<Args...>>::type type;
+        // the i-th argument is equivalent to the i-th tuple element of a tuple
+        // composed of those arguments.
+    };
+};
+
+template <typename T>
+struct binary_function_traits {
+  using traits = function_traits<T>;
+  using result_type = typename traits::result_type;
+  using arg1_t = typename traits::template arg<0>::type;
+  using arg2_t = typename traits::template arg<1>::type;
+  // using arg2_t = arg<1>::type;
+};
+
+
+template<typename args, typename func_t>
+void launch_kernel(int N, const int64_t* sizes, const int64_t* strides, char** data_ptrs, func_t f) {
+  std::array<const int64_t*, 3> all_strides = {strides, strides, strides};
+  int ndim = 5;
+  auto offset_calc = OffsetCalculator<3>(ndim, sizes, all_strides);
+
+  using arg1_t = float;
+  using arg2_t = float;
+  using arg3_t = float;
+  arg1_t* out = (arg1_t*)data_ptrs[0];
+  arg2_t* in1 = (arg2_t*)data_ptrs[1];
+  arg3_t* in2 = (arg3_t*)data_ptrs[2];
+
+  dim3 block(NT);
+  dim3 grid(N / block.x / VT);
+  generic_kernel<<<grid, block>>>(N, [=]MGPU_DEVICE(int idx) {
+
+
+    auto offsets = offset_calc.get(idx);
+    auto res = f(in1[offsets[1]], in2[offsets[2]]);
+    using tmp = decltype(res);
+
+    out[offsets[0]] = (tmp)res;
+  });
+}
+
+template <int nt, int vt>
+__global__ void bandwidth_kernel(int N, const float* input, float* output) {
+  int idx = threadIdx.x + blockIdx.x * nt;
+
+  float buffer[vt];
+  #pragma unroll
+  for (int i = 0; i < vt; i++) {
+    buffer[i] = input[idx + i * nt * gridDim.x];
+  }
+  #pragma unroll
+  for (int i = 0; i < vt; i++) {
+    if (buffer[i] == 76.5) {
+      output[0] = 1;
     }
-
-    #pragma unroll
-    for (int i = 0; i < VT; i++) {
-      int idx1, idx2, idx3;
-      o1.get(linearIndex, &counter0, s1, s2, s3, &idx1, &idx2, &idx3);
-
-      out[idx1] = x[idx2] + y[idx3];
-      linearIndex += 32;
-    }
-  } else {
-    // assert(0);
   }
 }
 
@@ -76,7 +184,7 @@ static void verify(float* out_cuda, float* x_cuda, float* y_cuda, int N) {
   bool non_zero = false;
   for (int i = 0; i < N; i++) {
     if (out[i] != x[i] + y[i]) {
-      throw std::runtime_error(std::string("error at ") + std::to_string(i));
+      throw std::runtime_error(std::string("sum incorrect at ") + std::to_string(i));
     }
     if (x[i] != 0 && y[i] != 0) {
       non_zero = true;
@@ -110,17 +218,19 @@ static void fill_random(float* out_cuda, int N) {
   free(cpu);
 }
 
+void* global;
+
 int main(int argc, char* argv[]) {
   static const int N = 1024 * 1024 * 10;
   int64_t sizes[] = {10 * 32, 32, 32, 32, 1};
   int64_t strides[] = {1, 320, 10240, 327680, 327680};
 
-  auto offset = OffsetInfo(5, sizes);
-  auto stride_info = StrideInfo(5, strides);
+  // auto offset = OffsetCalculator(5, sizes);
+  // auto stride_info = StrideInfo(5, strides);
 
-  auto x = (float*)cuda_malloc(N * 2 * sizeof(float));
-  auto y = (float*)cuda_malloc(N * 2 * sizeof(float));
-  auto res = (float*)cuda_malloc(N * 2 * sizeof(float));
+  auto x = (float*)cuda_malloc(N * sizeof(float));
+  auto y = (float*)cuda_malloc(N * sizeof(float));
+  auto res = (float*)cuda_malloc(N * sizeof(float));
 
   fill_random(x, N);
   fill_random(y, N);
@@ -130,17 +240,31 @@ int main(int argc, char* argv[]) {
 
   std::cout << "multiProcessorCount: " << deviceProperties.multiProcessorCount << "\n";
 
-  dim3 block(NT);
-  dim3 grid(N / block.x / VT);
+  static constexpr int nt = 512;
+  static constexpr int vt = 4;
+  dim3 block(512);
+  dim3 grid(N / nt / vt);
+
+  std::cout << grid.x << " x " << block.x << "\n";
 
   CUDA_CHECK(cudaDeviceSynchronize());
+  char* data[3] = {(char*)res, (char*)x, (char*)y};
   for (int i = 0; i < 10; i++) {
     cuda_timestamp start;
-    add_kernel<<<grid, block>>>(res, x, y, N, offset, stride_info, stride_info, stride_info);
+    bandwidth_kernel<nt, vt><<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
+    // bandwidth_kernel<<<grid, block>>>(N, x, y);
     std::cout << "time " << start.elapsed_time() << "\n";
   }
 
-  verify(res, x, y, N);
+  // verify(res, x, y, N);
 
   // cuda_timestamp end;
   // int64_t ts[10];
